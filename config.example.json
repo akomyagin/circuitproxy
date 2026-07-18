@@ -1,0 +1,21 @@
+{
+  "listen": ":8080",
+  "backends": [
+    "http://127.0.0.1:9001",
+    "http://127.0.0.1:9002",
+    "http://127.0.0.1:9003"
+  ],
+  "health_check": {
+    "path": "/healthz",
+    "interval_seconds": 2,
+    "timeout_seconds": 1
+  },
+  "breaker": {
+    "failure_threshold": 5,
+    "open_timeout_seconds": 10
+  },
+  "retry": {
+    "max_retries": 2,
+    "backoff_base_ms": 50
+  }
+}
