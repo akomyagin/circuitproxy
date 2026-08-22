@@ -19,8 +19,28 @@ import (
 // Backend is a single upstream target and its liveness flag.
 type Backend struct {
 	URL *url.URL
-	// up is toggled by the health checker (Этап 2); balancer skips down backends.
+	// up is toggled by the health checker via SetUp; balancer skips down backends.
 	up atomic.Bool
+}
+
+// IsUp reports whether the backend is currently marked live by the health
+// checker. Safe for concurrent use.
+func (b *Backend) IsUp() bool { return b.up.Load() }
+
+// SetUp marks the backend live (true) or down (false). Called by the health
+// checker; safe for concurrent use.
+func (b *Backend) SetUp(up bool) { b.up.Store(up) }
+
+// HealthURL builds the absolute health-probe URL for this backend by joining
+// its base URL with path. path is the health endpoint from config (e.g. "/health").
+// Any query string or fragment on the base URL is dropped: a health probe
+// targets exactly path, not whatever query the proxied base URL happened to carry.
+func (b *Backend) HealthURL(path string) string {
+	u := *b.URL // copy; do not mutate the shared base URL
+	u.Path = path
+	u.RawQuery = ""
+	u.Fragment = ""
+	return u.String()
 }
 
 // Balancer selects backends round-robin across a static pool.
@@ -53,22 +73,35 @@ func NewBalancer(cfg *config.Config) (*Balancer, error) {
 	return &Balancer{backends: backends}, nil
 }
 
-// Next returns the next backend round-robin, or nil if none available.
-// It is safe for concurrent use: selection is a single atomic increment,
-// no mutexes on this hot path.
-//
-// TODO(Этап 2): skip backends whose up flag is false; return nil when all
-// backends are down.
+// Next returns the next live backend round-robin, or nil if all backends are
+// down. Selection stays lock-free: a single atomic increment picks a starting
+// slot (Add returns the post-increment value, so subtract 1 to make the very
+// first call land on index 0 and keep the cycle uniform), then we scan forward
+// at most n slots for a live backend. Worst case is O(n) with n being a
+// handful of backends. Liveness may change concurrently during the scan;
+// IsUp() is atomic, so the worst outcome is picking a backend that went down
+// a moment later (or skipping one that just recovered) — the next call
+// self-corrects. Eventually consistent rotation is acceptable here.
 func (b *Balancer) Next() *Backend {
 	n := uint64(len(b.backends))
 	if n == 0 {
 		return nil
 	}
-	// Add returns the post-increment value, so subtract 1 to make the very
-	// first call land on index 0 and keep the cycle uniform.
-	idx := (b.counter.Add(1) - 1) % n
-	return b.backends[idx]
+	start := b.counter.Add(1) - 1
+	for i := uint64(0); i < n; i++ {
+		idx := (start + i) % n
+		be := b.backends[idx]
+		if be.IsUp() {
+			return be
+		}
+	}
+	return nil
 }
+
+// Backends returns the balancer's backend pool for the health checker to probe.
+// The slice is the balancer's own backing store; callers must not append to or
+// reorder it, only read entries and toggle their liveness via SetUp.
+func (b *Balancer) Backends() []*Backend { return b.backends }
 
 // backendCtxKey carries the backend chosen by the outer handler into the
 // shared ReverseProxy's Rewrite via the request context.

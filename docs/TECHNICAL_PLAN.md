@@ -41,8 +41,10 @@ circuitproxy/
 ```
 
 `internal/` — вся логика непубличная (это приложение, не библиотека). Слои:
-`config` → зависит ни от кого; `breaker` → ни от кого; `healthcheck` → от `breaker`
-(помечает backend up/down); `proxy` → от `breaker` + `config`; `cmd` → собирает всё.
+`config` → зависит ни от кого; `breaker` → ни от кого; `proxy` → от `breaker` +
+`config`; `healthcheck` → от `proxy` + `config` (переключает liveness `proxy.Backend`
+через экспортируемые `Backend.SetUp`/`Balancer.Backends`, breaker ему не нужен —
+уточнено на планировании Этапа 2); `cmd` → собирает всё.
 
 ## Конкурентная модель circuit breaker (ядро проекта)
 

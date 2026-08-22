@@ -68,3 +68,8 @@ func Load(path string) (*Config, error) {
 func (h HealthCheckConfig) Interval() time.Duration {
 	return time.Duration(h.IntervalSeconds) * time.Second
 }
+
+// Timeout returns the per-probe HTTP timeout as a time.Duration.
+func (h HealthCheckConfig) Timeout() time.Duration {
+	return time.Duration(h.TimeoutSeconds) * time.Second
+}
