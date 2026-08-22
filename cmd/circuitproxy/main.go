@@ -1,17 +1,27 @@
 // Command circuitproxy is the CLI entry point for the CircuitProxy reverse proxy.
 //
-// Этап 0 skeleton: it parses the -config flag, loads the JSON config, and prints
-// the parsed result. The HTTP server is wired up starting from Этап 1.
+// It parses the -config flag, loads the JSON config, builds the round-robin
+// balancer and serves HTTP on the configured listen address until SIGINT or
+// SIGTERM, then shuts down gracefully.
 package main
 
 import (
+	"context"
+	"errors"
 	"flag"
-	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
 	"github.com/akomyagin/circuitproxy/internal/config"
+	"github.com/akomyagin/circuitproxy/internal/proxy"
 )
+
+// shutdownTimeout bounds how long in-flight requests may drain on shutdown.
+const shutdownTimeout = 5 * time.Second
 
 func main() {
 	if err := run(); err != nil {
@@ -29,15 +39,50 @@ func run() error {
 		return err
 	}
 
-	// TODO(Этап 1): build the balancer, wire httputil.ReverseProxy, start the
-	// http.Server on cfg.Listen.
-	// TODO(Этап 2): start the health-check loop under a cancellable context.
+	balancer, err := proxy.NewBalancer(cfg)
+	if err != nil {
+		return err
+	}
+
+	srv := &http.Server{
+		Addr:    cfg.Listen,
+		Handler: balancer.Handler(),
+	}
+
+	// ctx is cancelled on SIGINT/SIGTERM; Этап 2 will also hang the
+	// health-check loop off this context.
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	// TODO(Этап 2): start the health-check loop under ctx.
 	// TODO(Этап 5): structured slog logging of breaker transitions + /metrics.
-	slog.Info("config loaded",
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	slog.Info("circuitproxy started",
 		"listen", cfg.Listen,
 		"backends", len(cfg.Backends),
 	)
-	fmt.Printf("circuitproxy Этап 0: loaded %d backend(s), listen=%q (server not started yet)\n",
-		len(cfg.Backends), cfg.Listen)
+
+	select {
+	case err := <-errCh:
+		// ListenAndServe failed on its own (e.g. address already in use).
+		return err
+	case <-ctx.Done():
+	}
+
+	slog.Info("shutdown signal received, draining")
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		return err
+	}
+	if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return err
+	}
+	slog.Info("circuitproxy stopped")
 	return nil
 }
