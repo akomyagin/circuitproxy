@@ -98,16 +98,47 @@ func TestNext_EmptyPoolReturnsNil(t *testing.T) {
 	}
 }
 
+// TestNext_Concurrent hammers Next() from many goroutines while other
+// goroutines toggle liveness of backends 1 and 2. Backend 0 stays pinned up,
+// so Next() must never return nil: at least one backend is always live and
+// the forward scan is guaranteed to find it. Rotation under toggling is
+// eventually consistent, so beyond the nil-freedom invariant the test only
+// asserts that the race detector stays silent.
 func TestNext_Concurrent(t *testing.T) {
 	const goroutines = 50
 	const callsPerGoroutine = 200
+	const togglers = 4
 	b := mustBalancer(t,
 		"http://localhost:9001", "http://localhost:9002", "http://localhost:9003")
 
 	var picks atomic.Int64
 	var nils atomic.Int64
 	start := make(chan struct{})
-	var wg sync.WaitGroup
+	stopToggling := make(chan struct{})
+	var wg, toggleWg sync.WaitGroup
+
+	// Togglers flip liveness of backends 1 and 2 concurrently with Next().
+	// Backend 0 is never touched: it stays up for the whole run.
+	for i := 0; i < togglers; i++ {
+		i := i
+		toggleWg.Add(1)
+		go func() {
+			defer toggleWg.Done()
+			<-start
+			target := b.backends[1+i%2]
+			flip := false
+			for {
+				select {
+				case <-stopToggling:
+					return
+				default:
+					target.SetUp(flip)
+					flip = !flip
+				}
+			}
+		}()
+	}
+
 	for i := 0; i < goroutines; i++ {
 		wg.Add(1)
 		go func() {
@@ -124,12 +155,82 @@ func TestNext_Concurrent(t *testing.T) {
 	}
 	close(start)
 	wg.Wait()
+	close(stopToggling)
+	toggleWg.Wait()
 
 	if nils.Load() != 0 {
-		t.Errorf("Next() returned nil %d times on non-empty pool", nils.Load())
+		t.Errorf("Next() returned nil %d times while backend 0 was always up", nils.Load())
 	}
 	if got, want := picks.Load(), int64(goroutines*callsPerGoroutine); got != want {
 		t.Errorf("total picks = %d, want %d", got, want)
+	}
+}
+
+// --- Next(): liveness (Этап 2) ----------------------------------------------
+
+func TestNext_SkipsDown(t *testing.T) {
+	b := mustBalancer(t,
+		"http://localhost:9001", "http://localhost:9002", "http://localhost:9003")
+	down := b.backends[1]
+	down.SetUp(false)
+
+	counts := make(map[*Backend]int, 2)
+	for i := 0; i < 30; i++ {
+		got := b.Next()
+		if got == nil {
+			t.Fatalf("Next() call %d returned nil with two live backends", i)
+		}
+		if got == down {
+			t.Fatalf("Next() call %d returned a down backend %v", i, got.URL)
+		}
+		counts[got]++
+	}
+	for _, idx := range []int{0, 2} {
+		if counts[b.backends[idx]] == 0 {
+			t.Errorf("live backend %d never returned by Next()", idx)
+		}
+	}
+}
+
+func TestNext_AllDown_ReturnsNil(t *testing.T) {
+	b := mustBalancer(t,
+		"http://localhost:9001", "http://localhost:9002", "http://localhost:9003")
+	for _, backend := range b.backends {
+		backend.SetUp(false)
+	}
+	for i := 0; i < 10; i++ {
+		if got := b.Next(); got != nil {
+			t.Fatalf("Next() call %d = %v, want nil with all backends down", i, got.URL)
+		}
+	}
+}
+
+func TestNext_RecoveryReturnsToRotation(t *testing.T) {
+	b := mustBalancer(t,
+		"http://localhost:9001", "http://localhost:9002", "http://localhost:9003")
+	b.backends[0].SetUp(false)
+	b.backends[1].SetUp(false)
+
+	for i := 0; i < 10; i++ {
+		if got := b.Next(); got != b.backends[2] {
+			t.Fatalf("Next() call %d = %v, want the only live backend %v", i, got, b.backends[2].URL)
+		}
+	}
+
+	b.backends[1].SetUp(true)
+	counts := make(map[*Backend]int, 2)
+	for i := 0; i < 20; i++ {
+		got := b.Next()
+		if got == nil || got == b.backends[0] {
+			t.Fatalf("Next() call %d = %v, want one of the two live backends", i, got)
+		}
+		counts[got]++
+	}
+	if counts[b.backends[1]] == 0 {
+		t.Error("recovered backend never returned to rotation")
+	}
+	if counts[b.backends[2]] == 0 {
+		t.Error("always-live backend dropped out of rotation")
 	}
 }
 

@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/akomyagin/circuitproxy/internal/config"
+	"github.com/akomyagin/circuitproxy/internal/healthcheck"
 	"github.com/akomyagin/circuitproxy/internal/proxy"
 )
 
@@ -49,12 +50,17 @@ func run() error {
 		Handler: balancer.Handler(),
 	}
 
-	// ctx is cancelled on SIGINT/SIGTERM; Этап 2 will also hang the
-	// health-check loop off this context.
+	// ctx is cancelled on SIGINT/SIGTERM; both the server shutdown path and
+	// the health-check loop hang off it.
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// TODO(Этап 2): start the health-check loop under ctx.
+	// Run blocks, so it goes in a goroutine. On SIGINT/SIGTERM ctx is
+	// cancelled and Run returns; an in-flight probe is aborted via its
+	// request context, so no separate shutdown path is needed.
+	checker := healthcheck.New(cfg.HealthCheck, balancer.Backends())
+	go checker.Run(ctx)
+
 	// TODO(Этап 5): structured slog logging of breaker transitions + /metrics.
 
 	errCh := make(chan error, 1)
