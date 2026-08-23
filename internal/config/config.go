@@ -78,3 +78,9 @@ func (h HealthCheckConfig) Timeout() time.Duration {
 func (b BreakerConfig) OpenTimeout() time.Duration {
 	return time.Duration(b.OpenTimeoutSeconds) * time.Second
 }
+
+// BackoffBase returns the retry backoff base as a time.Duration. Unlike the
+// *_seconds fields above, backoff_base_ms is in MILLISECONDS.
+func (r RetryConfig) BackoffBase() time.Duration {
+	return time.Duration(r.BackoffBaseMs) * time.Millisecond
+}

@@ -4,6 +4,7 @@ import (
 	"net/url"
 
 	"github.com/akomyagin/circuitproxy/internal/breaker"
+	"github.com/akomyagin/circuitproxy/internal/config"
 )
 
 // newBalancerWithBreaker builds a single-backend balancer whose backend uses the
@@ -19,4 +20,23 @@ func newBalancerWithBreaker(rawURL string, cfg breaker.Config) (*Balancer, *Back
 	be.cb = breaker.New(cfg)
 	bal := &Balancer{backends: []*Backend{be}}
 	return bal, be, nil
+}
+
+// newBalancerWithBreakers builds a multi-backend balancer where every backend
+// uses the given breaker config (allowing injected time via bcfg.Now) and the
+// balancer carries the given retry policy. Test-only accessor for Этап 4
+// retry+breaker scenarios; backend order follows rawURLs.
+func newBalancerWithBreakers(rawURLs []string, bcfg breaker.Config, rcfg config.RetryConfig) (*Balancer, error) {
+	backends := make([]*Backend, 0, len(rawURLs))
+	for _, raw := range rawURLs {
+		u, err := url.Parse(raw)
+		if err != nil {
+			return nil, err
+		}
+		be := &Backend{URL: u}
+		be.up.Store(true)
+		be.cb = breaker.New(bcfg)
+		backends = append(backends, be)
+	}
+	return &Balancer{backends: backends, retry: rcfg}, nil
 }

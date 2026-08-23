@@ -11,7 +11,15 @@ health checks, circuit breaker (closed / open / half-open) и retry с backoff.
 
 ## Статус
 
-Bootstrap (Этап 0). Реализация ведётся по Этапам — см. документацию.
+Этапы 0-4 смержены в `master`: базовый reverse proxy + round-robin (Этап 1),
+активный health-check (Этап 2), circuit breaker — ядро проекта (Этап 3, конкурентно-
+корректный half-open доказан тестом под `-race`), retry с экспоненциальным backoff
+(Этап 4, через кастомный `http.RoundTripper`, оборачивающий `Transport`). Следующий —
+**Этап 5: конфиг + наблюдаемость** (см. [docs/TECHNICAL_PLAN.md](docs/TECHNICAL_PLAN.md)
+§«Этап 5»).
+
+История этапов и принятые решения — в `docs/handoff/` (по одному файлу на этап) и
+`docs/plans/` (планы реализации).
 
 ## Быстрый старт (dev)
 
@@ -21,7 +29,7 @@ go build ./...
 go vet ./...
 go test -race ./...
 
-# запуск (после Этапа 1):
+# запуск:
 go run ./cmd/circuitproxy -config config.example.json
 ```
 
