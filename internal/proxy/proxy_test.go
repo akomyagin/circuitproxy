@@ -10,7 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/akomyagin/circuitproxy/internal/breaker"
 	"github.com/akomyagin/circuitproxy/internal/config"
 )
 
@@ -388,5 +390,227 @@ func TestHandler_NoBackendsReturns503(t *testing.T) {
 
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+	}
+}
+
+// --- Handler(): circuit breaker (Этап 3) ------------------------------------
+
+// clock is a test-controllable time source (nanoseconds) for injecting time
+// into a backend's breaker without real sleeps.
+type clock struct{ nanos atomic.Int64 }
+
+func newClock() *clock {
+	c := &clock{}
+	c.nanos.Store(time.Now().UnixNano())
+	return c
+}
+
+func (c *clock) now() time.Time          { return time.Unix(0, c.nanos.Load()) }
+func (c *clock) advance(d time.Duration) { c.nanos.Add(int64(d)) }
+
+func TestHandler_BreakerOpensAndFastFails(t *testing.T) {
+	const threshold = 3
+	var calls atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	clk := newClock()
+	bal, _, err := newBalancerWithBreaker(srv.URL, breaker.Config{
+		FailureThreshold: threshold,
+		OpenTimeout:      time.Hour,
+		Now:              clk.now,
+	})
+	if err != nil {
+		t.Fatalf("newBalancerWithBreaker: %v", err)
+	}
+	h := bal.Handler()
+
+	// First `threshold` requests reach the backend and get its 500 verbatim.
+	for i := 0; i < threshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("request %d: status = %d, want 500 (backend response proxied verbatim)", i, rec.Code)
+		}
+	}
+	if got := calls.Load(); got != threshold {
+		t.Fatalf("backend calls = %d, want %d before circuit opens", got, threshold)
+	}
+
+	// Circuit is now open: the next request must fast-fail 503 without hitting
+	// the backend.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("open circuit: status = %d, want 503", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "circuit breaker open") {
+		t.Errorf("open circuit body = %q, want to contain %q", rec.Body.String(), "circuit breaker open")
+	}
+	if got := calls.Load(); got != threshold {
+		t.Fatalf("backend calls = %d, want %d (fast-fail must not reach backend)", got, threshold)
+	}
+}
+
+func TestHandler_BreakerHalfOpenRecovers(t *testing.T) {
+	const threshold = 3
+	var calls atomic.Int64
+	var healthy atomic.Bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if healthy.Load() {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	clk := newClock()
+	const openTimeout = time.Minute
+	bal, _, err := newBalancerWithBreaker(srv.URL, breaker.Config{
+		FailureThreshold: threshold,
+		OpenTimeout:      openTimeout,
+		Now:              clk.now,
+	})
+	if err != nil {
+		t.Fatalf("newBalancerWithBreaker: %v", err)
+	}
+	h := bal.Handler()
+
+	// Drive the circuit open with 5xx responses.
+	for i := 0; i < threshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	}
+	callsAfterOpen := calls.Load()
+
+	// Advance past OpenTimeout and let the backend recover.
+	clk.advance(openTimeout + time.Second)
+	healthy.Store(true)
+
+	// One probe request goes through, hits the backend, gets 200 -> closes.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("probe request: status = %d, want 200", rec.Code)
+	}
+	if got := calls.Load(); got != callsAfterOpen+1 {
+		t.Fatalf("backend calls = %d, want %d (exactly one probe reached backend)", got, callsAfterOpen+1)
+	}
+
+	// Circuit closed: subsequent requests flow to the backend again.
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("post-recovery request: status = %d, want 200", rec.Code)
+	}
+	if got := calls.Load(); got != callsAfterOpen+2 {
+		t.Fatalf("backend calls = %d, want %d after recovery", got, callsAfterOpen+2)
+	}
+}
+
+func TestHandler_BreakerCounts5xxAsFailure(t *testing.T) {
+	const threshold = 3
+
+	t.Run("5xx opens the circuit", func(t *testing.T) {
+		var calls atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(http.StatusServiceUnavailable) // 503, a 5xx
+		}))
+		t.Cleanup(srv.Close)
+
+		bal, _, err := newBalancerWithBreaker(srv.URL, breaker.Config{
+			FailureThreshold: threshold,
+			OpenTimeout:      time.Hour,
+			Now:              newClock().now,
+		})
+		if err != nil {
+			t.Fatalf("newBalancerWithBreaker: %v", err)
+		}
+		h := bal.Handler()
+
+		for i := 0; i < threshold; i++ {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		}
+		// Circuit should now be open: fast-fail without reaching backend.
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code != http.StatusServiceUnavailable {
+			t.Fatalf("status = %d, want 503", rec.Code)
+		}
+		if got := calls.Load(); got != threshold {
+			t.Fatalf("backend calls = %d, want %d (5xx counted as failure, circuit opened)", got, threshold)
+		}
+	})
+
+	t.Run("4xx keeps the circuit closed", func(t *testing.T) {
+		var calls atomic.Int64
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			calls.Add(1)
+			w.WriteHeader(http.StatusNotFound) // 404, a 4xx = success for breaker
+		}))
+		t.Cleanup(srv.Close)
+
+		bal, _, err := newBalancerWithBreaker(srv.URL, breaker.Config{
+			FailureThreshold: threshold,
+			OpenTimeout:      time.Hour,
+			Now:              newClock().now,
+		})
+		if err != nil {
+			t.Fatalf("newBalancerWithBreaker: %v", err)
+		}
+		h := bal.Handler()
+
+		const n = threshold + 5
+		for i := 0; i < n; i++ {
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("request %d: status = %d, want 404 (proxied verbatim, never fast-failed)", i, rec.Code)
+			}
+		}
+		if got := calls.Load(); got != n {
+			t.Fatalf("backend calls = %d, want %d (4xx must not open the circuit)", got, n)
+		}
+	})
+}
+
+func TestHandler_BreakerCountsTransportErrorAsFailure(t *testing.T) {
+	const threshold = 3
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
+	target := srv.URL
+	srv.Close() // backend fully down -> connection refused -> transport error
+
+	bal, _, err := newBalancerWithBreaker(target, breaker.Config{
+		FailureThreshold: threshold,
+		OpenTimeout:      time.Hour,
+		Now:              newClock().now,
+	})
+	if err != nil {
+		t.Fatalf("newBalancerWithBreaker: %v", err)
+	}
+	h := bal.Handler()
+
+	// First `threshold` requests actually attempt the backend -> 502 each.
+	for i := 0; i < threshold; i++ {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+		if rec.Code != http.StatusBadGateway {
+			t.Fatalf("request %d: status = %d, want 502 (transport error, real attempt)", i, rec.Code)
+		}
+	}
+
+	// Circuit now open from transport failures: next request fast-fails 503,
+	// not 502 -> proves ErrorHandler reported the failures.
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("open circuit: status = %d, want 503 (not 502)", rec.Code)
 	}
 }

@@ -73,3 +73,8 @@ func (h HealthCheckConfig) Interval() time.Duration {
 func (h HealthCheckConfig) Timeout() time.Duration {
 	return time.Duration(h.TimeoutSeconds) * time.Second
 }
+
+// OpenTimeout returns the breaker open-state timeout as a time.Duration.
+func (b BreakerConfig) OpenTimeout() time.Duration {
+	return time.Duration(b.OpenTimeoutSeconds) * time.Second
+}
