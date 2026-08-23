@@ -8,7 +8,9 @@ package main
 import (
 	"context"
 	"errors"
+	"expvar"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -61,22 +63,46 @@ func run() error {
 	checker := healthcheck.New(cfg.HealthCheck, balancer.Backends())
 	go checker.Run(ctx)
 
-	// TODO(Этап 5): structured slog logging of breaker transitions + /metrics.
-
 	errCh := make(chan error, 1)
 	go func() {
 		errCh <- srv.ListenAndServe()
 	}()
 
-	slog.Info("circuitproxy started",
+	// Optional metrics server (Этап 5): expvar counters on a SEPARATE
+	// listener, because the main one proxies every path to the backends and
+	// mounting /debug/vars there would hijack client traffic. Disabled when
+	// metrics_listen is empty. metricsCh stays nil (blocks forever in the
+	// select) when the server is not started.
+	var metricsSrv *http.Server
+	var metricsCh chan error
+	if cfg.MetricsListen != "" {
+		mux := http.NewServeMux()
+		mux.Handle("/debug/vars", expvar.Handler())
+		metricsSrv = &http.Server{
+			Addr:    cfg.MetricsListen,
+			Handler: mux,
+		}
+		metricsCh = make(chan error, 1)
+		go func() {
+			metricsCh <- metricsSrv.ListenAndServe()
+		}()
+	}
+
+	startAttrs := []any{
 		"listen", cfg.Listen,
 		"backends", len(cfg.Backends),
-	)
+	}
+	if cfg.MetricsListen != "" {
+		startAttrs = append(startAttrs, "metrics_listen", cfg.MetricsListen)
+	}
+	slog.Info("circuitproxy started", startAttrs...)
 
 	select {
 	case err := <-errCh:
 		// ListenAndServe failed on its own (e.g. address already in use).
 		return err
+	case err := <-metricsCh:
+		return fmt.Errorf("metrics server: %w", err)
 	case <-ctx.Done():
 	}
 
@@ -88,6 +114,14 @@ func run() error {
 	}
 	if err := <-errCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
 		return err
+	}
+	if metricsSrv != nil {
+		if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+			return err
+		}
+		if err := <-metricsCh; err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
 	}
 	slog.Info("circuitproxy stopped")
 	return nil

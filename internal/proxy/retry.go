@@ -3,12 +3,32 @@ package proxy
 import (
 	"bytes"
 	"errors"
+	"expvar"
 	"io"
 	"math/rand/v2"
 	"net/http"
 	"time"
 
 	"github.com/akomyagin/circuitproxy/internal/config"
+)
+
+// Global expvar counters (Этап 5), served on the optional metrics listener
+// under /debug/vars. expvar.Int is atomic inside, so increments from
+// concurrent request goroutines need no extra synchronization. Registered
+// exactly once at package init — expvar panics on duplicate names.
+var (
+	// requestsTotal — incoming proxied requests (one per RoundTrip).
+	requestsTotal = expvar.NewInt("requests_total")
+	// errorsTotal — requests that finished as an error for the client: a
+	// transport error or a final 5xx after retries were exhausted. Exactly
+	// one increment per request, not per attempt.
+	errorsTotal = expvar.NewInt("errors_total")
+	// fastFailTotal — requests where not a single attempt could start
+	// (no live backends / every circuit open) — the synthetic 503 path.
+	fastFailTotal = expvar.NewInt("fast_fail_total")
+	// retriesTotal — actually performed EXTRA attempts (the first attempt is
+	// not a retry).
+	retriesTotal = expvar.NewInt("retries_total")
 )
 
 // Sentinel errors returned by retryTransport.RoundTrip when not a single
@@ -143,13 +163,30 @@ func (t *retryTransport) pickBackend() (*Backend, error) {
 	return nil, errAllCircuitsOpen // live backends exist, all circuits refuse
 }
 
-// RoundTrip implements http.RoundTripper: up to 1+maxRetries attempts for
-// idempotent requests (exactly one otherwise), each on a freshly picked
-// backend, with exponential backoff between attempts and per-attempt breaker
-// accounting. On exhaustion it returns the LAST real result — the final
-// backend response verbatim (even 5xx) or the final transport error (Решение
-// 5); if no attempt could even start, a sentinel error mapping to 503.
+// RoundTrip implements http.RoundTripper: it counts the request, delegates the
+// attempt loop to roundTrip unchanged, and classifies the FINAL outcome for
+// the expvar counters in one place — a sentinel (nothing was contacted) bumps
+// fast_fail_total, any other error or a final 5xx bumps errors_total, so each
+// counter moves exactly once per request no matter how many attempts ran.
 func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	requestsTotal.Add(1)
+	resp, err := t.roundTrip(req)
+	switch {
+	case errors.Is(err, errNoBackends) || errors.Is(err, errAllCircuitsOpen):
+		fastFailTotal.Add(1)
+	case err != nil || resp.StatusCode >= 500:
+		errorsTotal.Add(1)
+	}
+	return resp, err
+}
+
+// roundTrip runs up to 1+maxRetries attempts for idempotent requests (exactly
+// one otherwise), each on a freshly picked backend, with exponential backoff
+// between attempts and per-attempt breaker accounting. On exhaustion it
+// returns the LAST real result — the final backend response verbatim (even
+// 5xx) or the final transport error (Решение 5); if no attempt could even
+// start, a sentinel error mapping to 503.
+func (t *retryTransport) roundTrip(req *http.Request) (*http.Response, error) {
 	attempts := 1
 	if t.maxRetries > 0 && isIdempotent(req.Method) {
 		attempts = 1 + t.maxRetries
@@ -186,6 +223,7 @@ func (t *retryTransport) RoundTrip(req *http.Request) (*http.Response, error) {
 
 	for attempt := 0; attempt < attempts; attempt++ {
 		if attempt > 0 {
+			retriesTotal.Add(1) // every extra attempt beyond the first
 			d := t.backoffDelay(attempt)
 			t.sleep(d + t.jitter(d))
 		}

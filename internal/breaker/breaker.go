@@ -9,6 +9,7 @@ package breaker
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"time"
 )
@@ -24,6 +25,19 @@ const (
 	// StateHalfOpen — exactly one probe request is admitted.
 	StateHalfOpen
 )
+
+// String returns a human-readable state name for logs and error messages.
+func (s State) String() string {
+	switch s {
+	case StateClosed:
+		return "closed"
+	case StateOpen:
+		return "open"
+	case StateHalfOpen:
+		return "half-open"
+	}
+	return fmt.Sprintf("unknown(%d)", int32(s))
+}
 
 // ErrBreakerOpen is returned by Allow when the request must not reach the backend.
 var ErrBreakerOpen = errors.New("circuit breaker open")
@@ -43,6 +57,15 @@ type Config struct {
 	OpenTimeout time.Duration
 	// Now is injected for deterministic testing; defaults to time.Now.
 	Now func() time.Time
+	// OnTransition, if set, is called synchronously at the exact moment the
+	// breaker changes state, with the previous and new state. It runs on the
+	// goroutine that caused the transition, INSIDE Report/Allow, AFTER the
+	// atomic state store. It fires only on a REAL transition — the closed hot
+	// path without transitions never invokes it and pays nothing. The callback
+	// must be cheap and non-blocking (no I/O that can stall, no locks that can
+	// contend on the hot path) and must not panic (a panic would propagate out
+	// of Report/Allow). Optional; nil disables transition notifications.
+	OnTransition func(from, to State)
 }
 
 // Breaker is a per-backend circuit breaker. The zero value is not usable; use New.
@@ -55,6 +78,7 @@ type Breaker struct {
 	failureThreshold int32
 	openTimeout      time.Duration
 	now              func() time.Time
+	onTransition     func(from, to State) // nil = no transition notifications
 }
 
 // New constructs a Breaker in the closed state.
@@ -71,6 +95,7 @@ func New(cfg Config) *Breaker {
 		failureThreshold: cfg.FailureThreshold,
 		openTimeout:      openTimeout,
 		now:              now,
+		onTransition:     cfg.OnTransition,
 	}
 	// Normalize a non-positive threshold to 1 ("open on the first failure").
 	// The config is not validated until Этап 5 (same nature as interval=0 on
@@ -105,7 +130,11 @@ func (b *Breaker) Allow() (bool, error) {
 		// the single probe slot in admitHalfOpenProbe. Losers of this CAS do
 		// NOT retry/spin: they just fall through to the trialInFlight CAS, where
 		// they almost certainly lose and fast-fail — the desired behavior.
-		b.state.CompareAndSwap(int32(StateOpen), int32(StateHalfOpen))
+		// Only the CAS winner performed the transition, so only it notifies —
+		// otherwise one transition would be reported N times under load.
+		if b.state.CompareAndSwap(int32(StateOpen), int32(StateHalfOpen)) {
+			b.notifyTransition(StateOpen, StateHalfOpen)
+		}
 		return b.admitHalfOpenProbe()
 	case StateHalfOpen:
 		return b.admitHalfOpenProbe()
@@ -130,17 +159,26 @@ func (b *Breaker) admitHalfOpenProbe() (bool, error) {
 func (b *Breaker) Report(success bool) {
 	switch State(b.state.Load()) {
 	case StateHalfOpen:
+		// to is a local constant of THIS transition: the callback must not
+		// re-read the atomic state after the probe slot is released — another
+		// goroutine may have transitioned again by then.
+		var to State
 		if success {
 			b.failures.Store(0)
 			b.state.Store(int32(StateClosed))
+			to = StateClosed
 		} else {
 			b.openedAtNanos.Store(b.now().UnixNano())
 			b.state.Store(int32(StateOpen))
+			to = StateOpen
 		}
 		// Release the probe slot LAST, after the target state is set, so no
 		// other goroutine can observe half-open with trialInFlight=false and
 		// grab a "second" probe in the same window.
 		b.trialInFlight.Store(false)
+		// Notify AFTER the slot release: a slow callback (e.g. logging) must
+		// not delay the probe slot becoming available again.
+		b.notifyTransition(StateHalfOpen, to)
 	case StateClosed:
 		if success {
 			// Reset the streak only if there is one (avoid a redundant write).
@@ -152,8 +190,10 @@ func (b *Breaker) Report(success bool) {
 		if b.failures.Add(1) >= b.failureThreshold {
 			// CAS so we do not clobber a concurrent transition made by another
 			// goroutine (e.g. one that already moved us to open/half-open).
+			// Only the CAS winner made the transition, so only it notifies.
 			if b.state.CompareAndSwap(int32(StateClosed), int32(StateOpen)) {
 				b.openedAtNanos.Store(b.now().UnixNano())
+				b.notifyTransition(StateClosed, StateOpen)
 			}
 		}
 	case StateOpen:
@@ -161,6 +201,15 @@ func (b *Breaker) Report(success bool) {
 		// requests fast-fail in Allow and never reach the backend, so Report is
 		// not called). Deliberately do NOT touch openedAtNanos — a stray call
 		// must not extend the open window indefinitely.
+	}
+}
+
+// notifyTransition invokes the optional OnTransition hook. Callers pass the
+// from/to of the transition they THEMSELVES just performed (local constants),
+// never values re-read from the atomic state.
+func (b *Breaker) notifyTransition(from, to State) {
+	if b.onTransition != nil {
+		b.onTransition(from, to)
 	}
 }
 
