@@ -11,12 +11,15 @@ health checks, circuit breaker (closed / open / half-open) и retry с backoff.
 
 ## Статус
 
-Этапы 0-4 смержены в `master`: базовый reverse proxy + round-robin (Этап 1),
-активный health-check (Этап 2), circuit breaker — ядро проекта (Этап 3, конкурентно-
-корректный half-open доказан тестом под `-race`), retry с экспоненциальным backoff
-(Этап 4, через кастомный `http.RoundTripper`, оборачивающий `Transport`). Следующий —
-**Этап 5: конфиг + наблюдаемость** (см. [docs/TECHNICAL_PLAN.md](docs/TECHNICAL_PLAN.md)
-§«Этап 5»).
+Этапы 0-5 смержены в `master` — **MVP завершён**: базовый reverse proxy +
+round-robin (Этап 1), активный health-check (Этап 2), circuit breaker — ядро
+проекта (Этап 3, конкурентно-корректный half-open доказан тестом под `-race`),
+retry с экспоненциальным backoff (Этап 4, через кастомный `http.RoundTripper`,
+оборачивающий `Transport`), финальная валидация конфига и наблюдаемость (Этап 5:
+`slog`-логирование переходов breaker'а, `expvar`-счётчики на отдельном
+`metrics_listen`). Дальше — по приоритету
+[docs/POST_MVP_PLAN.md](docs/POST_MVP_PLAN.md) (weighted balancing, sticky
+sessions, TLS termination, маршрутизация).
 
 История этапов и принятые решения — в `docs/handoff/` (по одному файлу на этап) и
 `docs/plans/` (планы реализации).

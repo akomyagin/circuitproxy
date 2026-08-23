@@ -74,12 +74,12 @@ func NewBalancer(cfg *config.Config) (*Balancer, error) {
 	}
 	backends := make([]*Backend, 0, len(cfg.Backends))
 	for _, raw := range cfg.Backends {
-		u, err := url.Parse(raw)
+		// Shared with config.Validate (Этап 5, Решение 4): one parsing helper,
+		// one error message. Kept here as defense-in-depth for callers that
+		// build a Config in code and bypass config.Load.
+		u, err := config.ParseBackendURL(raw)
 		if err != nil {
-			return nil, fmt.Errorf("proxy: parse backend URL %q: %w", raw, err)
-		}
-		if u.Scheme == "" || u.Host == "" {
-			return nil, fmt.Errorf("proxy: backend URL %q is not absolute (need scheme and host)", raw)
+			return nil, fmt.Errorf("proxy: %w", err)
 		}
 		b := &Backend{URL: u}
 		b.up.Store(true)
@@ -87,10 +87,33 @@ func NewBalancer(cfg *config.Config) (*Balancer, error) {
 			FailureThreshold: cfg.Breaker.FailureThreshold,
 			OpenTimeout:      cfg.Breaker.OpenTimeout(),
 			// Now not set — breaker.New defaults to time.Now.
+			// This is the only place that knows both the breaker and the
+			// backend URL, so the backend label enters here via the closure;
+			// the breaker package itself stays backend-agnostic.
+			OnTransition: transitionLogger(b),
 		})
 		backends = append(backends, b)
 	}
 	return &Balancer{backends: backends, retry: cfg.Retry}, nil
+}
+
+// transitionLogger returns the OnTransition hook for backend b: exactly one
+// slog record per REAL breaker state change, labeled with the backend URL.
+// The hook runs synchronously inside Report/Allow, only on transitions —
+// transitions are rare by definition, so slog here is acceptable and the
+// closed hot path pays nothing.
+//
+// Level choice (deliberate): uniformly Info for every transition, matching
+// healthcheck's "backend recovered"; operators filter by to=open. No separate
+// Warn for opening — from/to fields carry the severity signal.
+func transitionLogger(b *Backend) func(from, to breaker.State) {
+	return func(from, to breaker.State) {
+		slog.Info("circuit breaker transition",
+			"backend", b.URL.String(),
+			"from", from.String(),
+			"to", to.String(),
+		)
+	}
 }
 
 // Next returns the next live backend round-robin, or nil if all backends are
